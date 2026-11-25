@@ -32,3 +32,28 @@ def get_settings() -> Settings:
         raise ValueError("GROQ_MODEL must not be empty.")
 
     return Settings(groq_api_key=api_key, groq_model=model)
+
+
+# ---------------------------------------------------------------------------
+# Storage configuration (new for Adaptive AI Learning System)
+# ---------------------------------------------------------------------------
+
+
+def get_db_path() -> str:
+    """Return the SQLite database file path (default: ./data/learning.db)."""
+    return os.getenv("DB_PATH", "./data/learning.db").strip()
+
+
+def get_chroma_path() -> str:
+    """Return the ChromaDB persistence directory (default: ./data/chroma)."""
+    return os.getenv("CHROMA_PATH", "./data/chroma").strip()
+
+
+def get_embedding_model() -> str:
+    """Return the HuggingFace sentence-transformers model name."""
+    return os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2").strip()
+
+
+def get_huggingface_token() -> str:
+    """Return the HuggingFace Hub API token (may be empty for public models)."""
+    return os.getenv("HUGGINGFACEHUB_API_TOKEN", "").strip()

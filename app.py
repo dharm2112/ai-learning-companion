@@ -1,18 +1,39 @@
-"""Streamlit interface for the AI Learning Companion."""
+"""Streamlit interface for the AI Learning Companion — Adaptive Edition."""
 
 from datetime import datetime
 
 import streamlit as st
 
 from chains.evaluation_chain import evaluate_quiz
-from chains.explanation_chain import generate_explanation
+from chains.explanation_chain import generate_explanation, generate_contextual_explanation
 from chains.learning_chain import (
     generate_custom_learning,
     generate_learning_recommendations,
 )
 from chains.parallel_chain import generate_learning_material
-from chains.quiz_chain import generate_quiz
+from chains.quiz_chain import generate_quiz, generate_adaptive_quiz
+from db.migrations import run_migrations
 from schemas import Quiz, QuizEvaluation, QuestionType, TopicExplanation
+from services.adaptive_quiz import build_quiz_context
+from services.learning_history import (
+    complete_session,
+    get_learner_profile,
+    save_quiz_attempt,
+    start_session,
+    update_concept_progress,
+    get_weak_concepts_for_topic,
+)
+from services.recommendation_engine import (
+    generate_recommendations,
+    format_recommendations_as_text,
+)
+
+# Run DB migrations on startup (no-op if tables already exist).
+try:
+    run_migrations()
+except Exception:
+    pass  # DB not available — degrade gracefully
+
 
 
 st.set_page_config(
@@ -82,10 +103,23 @@ def initialize_state() -> None:
         "recommendations": None,
         "custom_explanation": None,
         "history": [],
+        # --- Adaptive Learning System additions ---
+        "db_session_id": None,       # current LearningSession PK
+        "db_user_id": None,          # User PK (set by user_identity service)
+        "adaptive_recommendations": None,  # RecommendationSet
+        "learner_profile": None,     # LearnerProfile (cached per session)
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    # Initialise persistent user identity (safe no-op if DB unavailable).
+    if st.session_state.db_user_id is None:
+        try:
+            from services.user_identity import get_or_create_user
+            st.session_state.db_user_id = get_or_create_user()
+        except Exception:
+            st.session_state.db_user_id = -1  # sentinel: DB unavailable
 
 
 def show_error(message: str) -> None:
@@ -107,6 +141,9 @@ def reset_learning_session() -> None:
     st.session_state.answers = {}
     st.session_state.recommendations = None
     st.session_state.custom_explanation = None
+    st.session_state.db_session_id = None
+    st.session_state.adaptive_recommendations = None
+    st.session_state.learner_profile = None
     st.session_state.page = "Learning Setup"
 
 
@@ -261,6 +298,18 @@ def render_setup() -> None:
                     st.session_state.explanation = None
                     st.session_state.quiz_started = True
                     st.session_state.page = "Quiz"
+
+                # --- Persist session start ---
+                db_user_id = st.session_state.get("db_user_id", -1)
+                if db_user_id and db_user_id > 0:
+                    try:
+                        mode = "learn_first" if path == "Learn + Test" else "test_first"
+                        st.session_state.db_session_id = start_session(
+                            db_user_id, topic.strip(), mode, level
+                        )
+                    except Exception:
+                        pass  # DB error — degrade gracefully, do not block UI
+
                 st.rerun()
             except Exception as error:
                 show_error("Could not generate learning material. Please try again.")
@@ -393,6 +442,59 @@ def render_quiz() -> None:
                                 st.session_state.learning_level,
                             )
 
+                        # --- Persist quiz results ---
+                        db_user_id = st.session_state.get("db_user_id", -1)
+                        db_session_id = st.session_state.get("db_session_id")
+                        if db_user_id and db_user_id > 0 and db_session_id:
+                            try:
+                                # Determine attempt type
+                                attempt_type = (
+                                    "follow_up"
+                                    if st.session_state.learning_path == "Test First"
+                                    else "initial"
+                                )
+                                # Build serialisable question results
+                                question_results = [
+                                    {
+                                        "concept_tested": r.concept_tested,
+                                        "question_text": next(
+                                            (q.question_text for q in quiz.questions if q.question_id == r.question_id),
+                                            "",
+                                        ),
+                                        "question_type": next(
+                                            (q.question_type.value for q in quiz.questions if q.question_id == r.question_id),
+                                            "MCQ",
+                                        ),
+                                        "user_answer": r.user_answer,
+                                        "correct_answer": r.correct_answer,
+                                        "is_correct": r.is_correct,
+                                        "explanation": r.explanation,
+                                    }
+                                    for r in evaluation.question_results
+                                ]
+                                save_quiz_attempt(
+                                    db_session_id,
+                                    attempt_type,
+                                    question_results,
+                                    evaluation.score_percentage,
+                                )
+                                update_concept_progress(
+                                    db_user_id,
+                                    st.session_state.topic,
+                                    question_results,
+                                )
+                                # Generate and cache adaptive recommendations
+                                profile = get_learner_profile(db_user_id)
+                                st.session_state.learner_profile = profile
+                                rec_set = generate_recommendations(
+                                    profile,
+                                    st.session_state.topic,
+                                    evaluation.score_percentage,
+                                )
+                                st.session_state.adaptive_recommendations = rec_set
+                            except Exception:
+                                pass  # DB error — degrade gracefully
+
                         st.session_state.history.append(
                             {
                                 "topic": st.session_state.topic,
@@ -469,12 +571,36 @@ def render_results() -> None:
     explore, new_quiz = st.columns(2)
     with explore:
         if st.button("Explore More Topics", type="primary"):
+            # Mark session complete when user moves forward
+            db_session_id = st.session_state.get("db_session_id")
+            if db_session_id:
+                try:
+                    complete_session(db_session_id)
+                except Exception:
+                    pass
             st.session_state.page = "Further Learning"
             st.rerun()
     with new_quiz:
         if st.button("Start Another Quiz"):
             reset_learning_session()
             st.rerun()
+
+    # --- Adaptive Recommendations ---
+    rec_set = st.session_state.get("adaptive_recommendations")
+    if rec_set and not rec_set.is_empty:
+        st.markdown('<h3 class="section-heading">📊 Personalised Recommendations</h3>', unsafe_allow_html=True)
+        if rec_set.revision:
+            st.markdown("**📖 Concepts to Revise**")
+            for rec in rec_set.revision:
+                st.info(f"**{rec.title}**\n\n{rec.reasoning}")
+        if rec_set.practice:
+            st.markdown("**🎯 Targeted Practice**")
+            for rec in rec_set.practice:
+                st.warning(f"**{rec.title}**\n\n{rec.reasoning}")
+        if rec_set.next_topic:
+            st.markdown("**🚀 Ready for More?**")
+            for rec in rec_set.next_topic:
+                st.success(f"**{rec.title}**\n\n{rec.reasoning}")
 
 
 def render_further_learning() -> None:
@@ -487,6 +613,50 @@ def render_further_learning() -> None:
 
     st.title("Your Next Learning Steps")
     st.caption("Build on your results with related topics and practical activities.")
+
+    # --- Adaptive Practice Quiz ---
+    db_user_id = st.session_state.get("db_user_id", -1)
+    topic = st.session_state.topic
+    if db_user_id and db_user_id > 0 and topic:
+        weak = get_weak_concepts_for_topic(db_user_id, topic)
+        if weak:
+            st.markdown("---")
+            st.subheader("🎯 Adaptive Practice Quiz")
+            st.write(
+                f"You have **{len(weak)} weak concept(s)** in **{topic}**: "
+                + ", ".join(f"`{c}`" for c in weak[:5])
+            )
+            if st.button("Start Adaptive Practice Quiz", type="primary"):
+                with st.spinner("Building your personalised quiz..."):
+                    try:
+                        ctx = build_quiz_context(
+                            db_user_id,
+                            topic,
+                            st.session_state.question_count,
+                            st.session_state.learning_level,
+                        )
+                        st.session_state.quiz = generate_adaptive_quiz(
+                            topic=ctx["topic"],
+                            learning_level=ctx["learning_level"] if ctx["learning_level"] else st.session_state.learning_level,
+                            question_count=ctx["question_count"],
+                            weak_concepts=ctx["weak_concepts"],
+                            mastered_concepts=ctx["mastered_concepts"],
+                            incorrect_history=ctx["incorrect_history"],
+                            has_history=ctx["has_history"],
+                        )
+                        # Reset quiz state for the new adaptive quiz
+                        st.session_state.quiz_evaluation = None
+                        st.session_state.quiz_started = True
+                        st.session_state.current_question = 0
+                        st.session_state.answers = {}
+                        st.session_state.confirm_submit = False
+                        st.session_state.adaptive_recommendations = None
+                        st.session_state.page = "Quiz"
+                        st.rerun()
+                    except Exception:
+                        show_error("Could not generate the adaptive quiz. Please try again.")
+            st.markdown("---")
+
     if st.button("Explore More", type="primary"):
         with st.spinner("Finding your next topics..."):
             try:
