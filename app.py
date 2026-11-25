@@ -5,20 +5,27 @@ from datetime import datetime
 import streamlit as st
 
 from chains.evaluation_chain import evaluate_quiz
-from chains.explanation_chain import generate_explanation, generate_contextual_explanation
+from chains.explanation_chain import (
+    generate_contextual_explanation,
+    generate_explanation,
+)
 from chains.learning_chain import (
     generate_custom_learning,
     generate_learning_recommendations,
 )
 from chains.parallel_chain import generate_learning_material
-from chains.quiz_chain import generate_quiz, generate_adaptive_quiz
+from chains.quiz_chain import generate_adaptive_quiz, generate_quiz
 from db.migrations import run_migrations
 from schemas import Quiz, QuizEvaluation, QuestionType, TopicExplanation
 from services.adaptive_quiz import build_quiz_context
 from services.learning_history import (
     complete_session,
     get_learner_profile,
+    get_user_history,
+    get_user_recommendations,
+    save_learner_memory,
     save_quiz_attempt,
+    save_recommendations,
     start_session,
     update_concept_progress,
     get_weak_concepts_for_topic,
@@ -29,11 +36,11 @@ from services.recommendation_engine import (
 )
 
 # Run DB migrations on startup (no-op if tables already exist).
+_database_startup_failed = False
 try:
     run_migrations()
 except Exception:
-    pass  # DB not available — degrade gracefully
-
+    _database_startup_failed = True
 
 
 st.set_page_config(
@@ -41,6 +48,12 @@ st.set_page_config(
     page_icon=":books:",
     layout="wide",
 )
+
+if _database_startup_failed:
+    st.warning(
+        "Persistent learning history is unavailable. You can continue learning, "
+        "but dashboard and adaptive features may be limited."
+    )
 
 st.markdown(
     """
@@ -108,6 +121,7 @@ def initialize_state() -> None:
         "db_user_id": None,          # User PK (set by user_identity service)
         "adaptive_recommendations": None,  # RecommendationSet
         "learner_profile": None,     # LearnerProfile (cached per session)
+        "memory_context": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -120,12 +134,74 @@ def initialize_state() -> None:
             st.session_state.db_user_id = get_or_create_user()
         except Exception:
             st.session_state.db_user_id = -1  # sentinel: DB unavailable
+            st.warning(
+                "A persistent learner profile could not be created. "
+                "You can continue, but saved progress will be unavailable."
+            )
 
 
 def show_error(message: str) -> None:
     """Show a safe error message without exposing provider internals."""
 
     st.error(message)
+
+
+def load_memory_context(topic: str) -> str:
+    """Retrieve prior-topic context for the current learner when available."""
+
+    db_user_id = st.session_state.get("db_user_id", -1)
+    if db_user_id <= 0:
+        return ""
+
+    try:
+        from services.learner_memory import (
+            build_memory_context,
+            retrieve_relevant_memories,
+        )
+        from services.learning_history import get_learner_profile
+        from services.user_identity import get_current_user_uuid
+
+        profile = get_learner_profile(db_user_id)
+        if not profile.topics_studied:
+            return ""
+        memories = retrieve_relevant_memories(
+            get_current_user_uuid(),
+            topic,
+        )
+        return build_memory_context(memories)
+    except Exception:
+        st.warning(
+            "Past-topic memory could not be loaded. Continuing without memory context."
+        )
+        return ""
+
+
+def save_completed_topic_memory(topic: str, explanation: TopicExplanation) -> None:
+    """Store the completed topic summary in SQLite and the semantic index."""
+
+    db_user_id = st.session_state.get("db_user_id", -1)
+    if db_user_id <= 0:
+        return
+
+    content = "\n".join(
+        [
+            f"Topic: {topic}",
+            f"Summary: {explanation.summary}",
+            "Key concepts: " + ", ".join(explanation.key_concepts),
+        ]
+    )
+    try:
+        save_learner_memory(db_user_id, topic, content)
+    except Exception:
+        st.warning("The topic summary could not be saved to learning history.")
+
+    try:
+        from services.learner_memory import save_topic_memory
+        from services.user_identity import get_current_user_uuid
+
+        save_topic_memory(get_current_user_uuid(), topic, content)
+    except Exception:
+        st.warning("The topic summary could not be saved to semantic memory.")
 
 
 def reset_learning_session() -> None:
@@ -141,6 +217,7 @@ def reset_learning_session() -> None:
     st.session_state.answers = {}
     st.session_state.recommendations = None
     st.session_state.custom_explanation = None
+    st.session_state.memory_context = ""
     st.session_state.db_session_id = None
     st.session_state.adaptive_recommendations = None
     st.session_state.learner_profile = None
@@ -278,6 +355,7 @@ def render_setup() -> None:
         st.session_state.quiz_evaluation = None
         st.session_state.recommendations = None
         st.session_state.custom_explanation = None
+        st.session_state.memory_context = load_memory_context(topic.strip())
         st.session_state.current_question = 0
         st.session_state.answers = {}
 
@@ -285,7 +363,10 @@ def render_setup() -> None:
             try:
                 if path == "Learn + Test":
                     material = generate_learning_material(
-                        topic.strip(), level, question_count
+                        topic.strip(),
+                        level,
+                        question_count,
+                        st.session_state.memory_context,
                     )
                     st.session_state.explanation = material["explanation"]
                     st.session_state.quiz = material["quiz"]
@@ -308,7 +389,10 @@ def render_setup() -> None:
                             db_user_id, topic.strip(), mode, level
                         )
                     except Exception:
-                        pass  # DB error — degrade gracefully, do not block UI
+                        st.warning(
+                            "The learning session could not be saved. "
+                            "Quiz generation can continue without persistence."
+                        )
 
                 st.rerun()
             except Exception as error:
@@ -437,9 +521,10 @@ def render_quiz() -> None:
                             focus = ", ".join(evaluation.weak_concepts)
                             if not focus:
                                 focus = "the complete topic"
-                            st.session_state.explanation = generate_explanation(
+                            st.session_state.explanation = generate_contextual_explanation(
                                 f"{st.session_state.topic} (focus on {focus})",
                                 st.session_state.learning_level,
+                                st.session_state.memory_context,
                             )
 
                         # --- Persist quiz results ---
@@ -472,7 +557,7 @@ def render_quiz() -> None:
                                     }
                                     for r in evaluation.question_results
                                 ]
-                                save_quiz_attempt(
+                                attempt_id = save_quiz_attempt(
                                     db_session_id,
                                     attempt_type,
                                     question_results,
@@ -482,6 +567,7 @@ def render_quiz() -> None:
                                     db_user_id,
                                     st.session_state.topic,
                                     question_results,
+                                    current_attempt_id=attempt_id,
                                 )
                                 # Generate and cache adaptive recommendations
                                 profile = get_learner_profile(db_user_id)
@@ -492,8 +578,30 @@ def render_quiz() -> None:
                                     evaluation.score_percentage,
                                 )
                                 st.session_state.adaptive_recommendations = rec_set
+                                save_recommendations(
+                                    db_user_id,
+                                    db_session_id,
+                                    [
+                                        {
+                                            "rec_type": recommendation.rec_type,
+                                            "title": recommendation.title,
+                                            "content": recommendation.reasoning,
+                                            "reasoning": recommendation.reasoning,
+                                            "target": recommendation.target,
+                                        }
+                                        for recommendation in rec_set.all_recommendations
+                                    ],
+                                )
                             except Exception:
-                                pass  # DB error — degrade gracefully
+                                st.warning(
+                                    "Quiz results could not be fully saved to learning history."
+                                )
+
+                        if isinstance(st.session_state.explanation, TopicExplanation):
+                            save_completed_topic_memory(
+                                st.session_state.topic,
+                                st.session_state.explanation,
+                            )
 
                         st.session_state.history.append(
                             {
@@ -577,7 +685,7 @@ def render_results() -> None:
                 try:
                     complete_session(db_session_id)
                 except Exception:
-                    pass
+                    st.warning("The learning session could not be marked complete.")
             st.session_state.page = "Further Learning"
             st.rerun()
     with new_quiz:
@@ -724,9 +832,38 @@ def render_settings() -> None:
 
 
 def render_history() -> None:
-    """Display sessions kept in this browser session only."""
+    """Display persistent history, falling back to this browser session."""
 
     st.title("My Learning History")
+    db_user_id = st.session_state.get("db_user_id", -1)
+    if db_user_id > 0:
+        try:
+            history = get_user_history(db_user_id)
+        except Exception:
+            st.error("Persistent learning history could not be loaded.")
+            return
+        if history:
+            st.dataframe(
+                [
+                    {
+                        "Topic": item["topic"],
+                        "Learning mode": item["learning_mode"],
+                        "Level": item["learning_level"],
+                        "Started": item["started_at"],
+                        "Latest score": (
+                            f"{item['latest_score']:.1f}%"
+                            if item["latest_score"] is not None
+                            else "Not submitted"
+                        ),
+                        "Completed": "Yes" if item["is_complete"] else "No",
+                    }
+                    for item in history
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+            return
+
     if not st.session_state.history:
         st.info("No completed learning sessions yet.")
         return
@@ -735,6 +872,80 @@ def render_history() -> None:
             f"**{session['topic']}** — {session['score']:.1f}% "
             f"({session['time']})"
         )
+
+
+def render_dashboard() -> None:
+    """Display persistent learner progress and recommendations."""
+
+    st.title("Learning Dashboard")
+    db_user_id = st.session_state.get("db_user_id", -1)
+    if db_user_id <= 0:
+        st.info("Persistent learning data is not available in this session.")
+        return
+
+    try:
+        profile = get_learner_profile(db_user_id)
+        history = get_user_history(db_user_id, limit=10)
+        recommendations = get_user_recommendations(db_user_id, limit=10)
+    except Exception:
+        st.error("The learning dashboard could not load your saved data.")
+        return
+
+    if profile.total_sessions == 0:
+        st.info("Complete a learning session to start building your dashboard.")
+        return
+
+    first, second, third = st.columns(3)
+    first.metric("Learning sessions", profile.total_sessions)
+    second.metric("Quiz attempts", profile.total_quiz_attempts)
+    third.metric("Topics studied", len(profile.topics_studied))
+
+    st.subheader("Concept mastery")
+    weak_column, learning_column, mastered_column = st.columns(3)
+    for column, title, concepts in (
+        (weak_column, "Needs practice", profile.weak_concepts),
+        (learning_column, "In progress", profile.learning_concepts),
+        (mastered_column, "Mastered", profile.mastered_concepts),
+    ):
+        with column:
+            st.markdown(f"**{title} ({len(concepts)})**")
+            if not concepts:
+                st.caption("No concepts here yet.")
+            for concept in concepts:
+                st.write(
+                    f"{concept.concept_name} — "
+                    f"{concept.weighted_score:.0%} mastery"
+                )
+
+    st.subheader("Recent sessions")
+    st.dataframe(
+        [
+            {
+                "Topic": item["topic"],
+                "Started": item["started_at"],
+                "Quiz attempts": item["attempt_count"],
+                "Latest score": (
+                    f"{item['latest_score']:.1f}%"
+                    if item["latest_score"] is not None
+                    else "Not submitted"
+                ),
+            }
+            for item in history
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.subheader("Saved recommendations")
+    if not recommendations:
+        st.info("No saved recommendations yet.")
+    else:
+        for recommendation in recommendations:
+            st.markdown(
+                f"**{recommendation['title']}** "
+                f"({recommendation['rec_type']})"
+            )
+            st.write(recommendation["reasoning"])
 
 
 initialize_state()
@@ -746,6 +957,7 @@ pages = [
     "Quiz",
     "Results",
     "Further Learning",
+    "Learning Dashboard",
     "My Learning History",
     "Settings",
 ]
@@ -774,5 +986,7 @@ elif current_page == "Further Learning":
     render_further_learning()
 elif current_page == "My Learning History":
     render_history()
+elif current_page == "Learning Dashboard":
+    render_dashboard()
 else:
     render_settings()

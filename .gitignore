@@ -30,6 +30,7 @@ build/
 # Streamlit and local runtime files
 .streamlit/secrets.toml
 *.log
+data/
 
 # Jupyter and notebook checkpoints
 .ipynb_checkpoints/

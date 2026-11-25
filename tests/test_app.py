@@ -57,3 +57,15 @@ def test_empty_topic_is_rejected_without_backend_call() -> None:
 
     assert not app_test.exception
     assert any("Please enter a topic." in error.value for error in app_test.error)
+
+
+def test_learning_dashboard_renders_for_a_new_learner() -> None:
+    app_test = AppTest.from_file(Path(__file__).parents[1] / "app.py").run()
+    app_test.sidebar.radio[0].set_value("Learning Dashboard").run()
+
+    assert not app_test.exception
+    assert any(title.value == "Learning Dashboard" for title in app_test.title)
+    assert any(
+        "Complete a learning session" in item.value
+        for item in app_test.info
+    )

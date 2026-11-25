@@ -23,8 +23,12 @@ from services.learning_history import (
     get_mastered_concepts_for_topic,
     get_or_create_topic,
     get_recent_incorrect_questions,
+    get_user_history,
+    get_user_recommendations,
     get_weak_concepts_for_topic,
+    save_learner_memory,
     save_quiz_attempt,
+    save_recommendations,
     start_session,
     update_concept_progress,
 )
@@ -248,6 +252,25 @@ class TestUpdateConceptProgress:
         assert row.status == "mastered"
         session.close()
 
+    def test_current_attempt_is_not_counted_twice(self, db, user_id):
+        session_id = start_session(user_id, "LangChain", "learn_first", "Beginner")
+        attempt_id = save_quiz_attempt(
+            session_id, "initial", _SAMPLE_RESULTS, 50.0
+        )
+
+        update_concept_progress(
+            user_id,
+            "LangChain",
+            _SAMPLE_RESULTS,
+            current_attempt_id=attempt_id,
+        )
+
+        factory = db
+        session = factory()
+        rows = session.query(ConceptProgress).filter_by(user_id=user_id).all()
+        assert {row.total_attempts for row in rows} == {1}
+        session.close()
+
 
 # ---------------------------------------------------------------------------
 # get_learner_profile
@@ -297,3 +320,33 @@ class TestConceptQueries:
         incorrect = get_recent_incorrect_questions(user_id, "LangChain", limit=5)
         assert len(incorrect) == 1
         assert incorrect[0]["concept_name"] == "Retrievers"
+
+
+def test_dashboard_queries_return_user_scoped_history_and_recommendations(
+    db, user_id
+):
+    session_id = start_session(user_id, "LangChain", "learn_first", "Beginner")
+    save_quiz_attempt(session_id, "initial", _SAMPLE_RESULTS, 50.0)
+    save_recommendations(
+        user_id,
+        session_id,
+        [
+            {
+                "rec_type": "practice",
+                "title": "Practice Retrievers",
+                "content": "Review retrievers.",
+                "reasoning": "This concept needs review.",
+                "target": "Retrievers",
+            }
+        ],
+    )
+    save_learner_memory(user_id, "LangChain", "A summary of LangChain.")
+
+    history = get_user_history(user_id)
+    recommendations = get_user_recommendations(user_id)
+
+    assert len(history) == 1
+    assert history[0]["topic"] == "LangChain"
+    assert history[0]["latest_score"] == 50.0
+    assert len(recommendations) == 1
+    assert recommendations[0]["title"] == "Practice Retrievers"

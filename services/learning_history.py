@@ -160,6 +160,7 @@ def update_concept_progress(
     db_user_id: int,
     topic_name: str,
     question_results: Sequence[dict],
+    current_attempt_id: int | None = None,
 ) -> None:
     """Upsert concept_progress rows using the WeakConceptTracker's logic.
 
@@ -170,11 +171,9 @@ def update_concept_progress(
     with get_session() as session:
         topic = get_or_create_topic(session, topic_name)
 
-        # Load all historical answers for this user × topic from the DB.
-        # We use them to rebuild full ConceptPerformance objects so the
-        # weighted score reflects *all* attempts, not just the latest quiz.
+        # Exclude the attempt being added below so its answers are not counted twice.
         historical: list[dict] = []
-        existing_rows = (
+        history_query = (
             session.query(QuizAnswer)
             .join(QuizAttempt, QuizAnswer.attempt_id == QuizAttempt.id)
             .join(LearningSession, QuizAttempt.session_id == LearningSession.id)
@@ -182,9 +181,12 @@ def update_concept_progress(
                 LearningSession.user_id == db_user_id,
                 LearningSession.topic_id == topic.id,
             )
-            .order_by(QuizAnswer.id)
-            .all()
         )
+        if current_attempt_id is not None:
+            history_query = history_query.filter(
+                QuizAttempt.id != current_attempt_id
+            )
+        existing_rows = history_query.order_by(QuizAnswer.id).all()
         for row in existing_rows:
             historical.append(
                 {
@@ -389,3 +391,79 @@ def save_recommendations(
                 target=rec.get("target", ""),
             )
             session.add(row)
+
+
+def save_learner_memory(
+    db_user_id: int,
+    topic_name: str,
+    content: str,
+    memory_type: str = "topic_summary",
+) -> None:
+    """Persist a learner's topic summary in SQLite."""
+    if not content.strip():
+        return
+
+    with get_session() as session:
+        memory = LearnerMemory(
+            user_id=db_user_id,
+            memory_type=memory_type,
+            topic_name=topic_name.strip(),
+            content=content.strip(),
+        )
+        session.add(memory)
+
+
+def get_user_history(db_user_id: int, limit: int = 20) -> list[dict]:
+    """Return recent learning sessions and their latest quiz scores."""
+    with get_session() as session:
+        sessions = (
+            session.query(LearningSession)
+            .filter_by(user_id=db_user_id)
+            .order_by(LearningSession.started_at.desc())
+            .limit(limit)
+            .all()
+        )
+        history = []
+        for learning_session in sessions:
+            attempts = sorted(
+                learning_session.quiz_attempts,
+                key=lambda attempt: attempt.attempted_at,
+            )
+            latest_score = (
+                attempts[-1].score_percentage if attempts else None
+            )
+            history.append(
+                {
+                    "topic": learning_session.topic.name,
+                    "learning_mode": learning_session.learning_mode,
+                    "learning_level": learning_session.learning_level,
+                    "started_at": learning_session.started_at,
+                    "completed_at": learning_session.completed_at,
+                    "is_complete": learning_session.is_complete,
+                    "attempt_count": len(attempts),
+                    "latest_score": latest_score,
+                }
+            )
+        return history
+
+
+def get_user_recommendations(db_user_id: int, limit: int = 10) -> list[dict]:
+    """Return recent persisted recommendations for one user."""
+    with get_session() as session:
+        rows = (
+            session.query(StoredRecommendation)
+            .filter_by(user_id=db_user_id)
+            .order_by(StoredRecommendation.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "rec_type": row.rec_type,
+                "title": row.title,
+                "reasoning": row.reasoning,
+                "target": row.target,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]

@@ -32,15 +32,20 @@ An incremental Streamlit learning application powered by LangChain and Groq.
    streamlit run app.py
    ```
 
-## Planned architecture
+## Current architecture
 
-- `config.py`: validated environment-backed settings.
-- `services/`: provider and business services; Phase 1 contains Groq model creation.
-- `schemas/`: Pydantic models for validated generated content.
-- `prompts/`: reusable prompt templates.
-- `chains/`: composable LangChain LCEL pipelines.
-- `utils/`: session and validation helpers.
-- `app.py`: Streamlit presentation layer.
+- `app.py`: Streamlit learning flows, persistent history, adaptive practice, and dashboard.
+- `chains/`: LCEL generation and evaluation pipelines, including contextual explanations.
+- `prompts/`: standard and memory-aware prompts for explanations and quizzes.
+- `schemas/`: validated Pydantic models for generated content and learner progress.
+- `services/`: learning history, concept mastery, recommendations, adaptive quiz context,
+  user identity, and semantic memory.
+- `db/`: SQLAlchemy models, SQLite engine, and additive table creation.
+- `data/`: local SQLite and ChromaDB storage (kept out of source control).
+
+SQLite stores quiz attempts, concept progress, learner summaries, and recommendations.
+ChromaDB retrieves related summaries using local HuggingFace sentence-transformer
+embeddings. Memory searches are filtered by the current learner UUID.
 
 ## Phase 2: schemas and structured output
 
@@ -55,9 +60,9 @@ LangChain's `with_structured_output()` asks the chat model for a schema-conformi
 response and parses it into a Pydantic object. The Phase 2 experiment is available
 at `experiments/structured_output.py`.
 
-Quiz answer keys remain in the backend `QuizQuestion` model. A later UI phase must
-map questions to a separate public schema without `correct_answer`, preventing
-answers from being sent to the browser before submission.
+Quiz answer keys remain in the backend `QuizQuestion` model. The UI maps questions
+to a separate public dictionary without `correct_answer`, preventing answers from
+being sent to the browser before submission.
 
 Example input:
 
@@ -217,19 +222,24 @@ Run the developer experiment with:
 .\.venv\Scripts\python.exe -m experiments.test_learning
 ```
 
-## Phase 8: Streamlit UI
+## Streamlit learning flows
 
 The Streamlit app in `app.py` is a thin presentation layer over the existing
-chains. It stores the current page, generated backend objects, quiz progress,
-answers, evaluation, recommendations, and in-memory history in
-`st.session_state`. Model calls happen only inside button handlers, so normal
-reruns do not generate new content.
+chains and services. It stores current quiz state in `st.session_state`, while
+completed sessions and learner progress are persisted in SQLite. Model calls
+happen inside button handlers, so normal reruns do not generate new content.
 
 Before quiz submission, the UI converts each backend question into a small
 public dictionary containing only `question_id`, `question_text`,
 `question_type`, and `options`. The original `Quiz` object stays in session
 state and is passed directly to `evaluate_quiz()` after submission. This keeps
 answer keys out of the question widgets.
+
+The Learning Dashboard shows saved session counts, concept mastery, recent quiz
+scores, and recommendations. On subsequent topics, related memories are retrieved
+from ChromaDB and passed to the contextual explanation chain. SQLite and ChromaDB
+dependencies are listed in `requirements.txt`; the database schema is initialized
+on app startup and can also be created with `python -m db.migrations`.
 
 Start the application with:
 

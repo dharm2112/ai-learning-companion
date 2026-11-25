@@ -2,20 +2,36 @@
 
 from langchain_core.runnables import Runnable, RunnableLambda, RunnableParallel
 
-from chains.explanation_chain import SUPPORTED_LEVELS, get_explanation_chain
+from chains.explanation_chain import (
+    SUPPORTED_LEVELS,
+    get_contextual_explanation_chain,
+    get_explanation_chain,
+)
 from chains.quiz_chain import get_quiz_chain
 from schemas import Quiz, TopicExplanation
 
 
-def get_parallel_chain() -> Runnable:
-    """Return one chain with explanation and quiz branches."""
+def get_parallel_chain(memory_context: str = "") -> Runnable:
+    """Return parallel explanation and quiz branches."""
 
-    explanation_input = RunnableLambda(
-        lambda data: {
-            "topic": data["topic"],
-            "learning_level": data["learning_level"],
-        }
-    )
+    if memory_context:
+        explanation_chain = get_contextual_explanation_chain()
+        explanation_input = RunnableLambda(
+            lambda data: {
+                "topic": data["topic"],
+                "learning_level": data["learning_level"],
+                "memory_context": data["memory_context"],
+            }
+        )
+    else:
+        explanation_chain = get_explanation_chain()
+        explanation_input = RunnableLambda(
+            lambda data: {
+                "topic": data["topic"],
+                "learning_level": data["learning_level"],
+            }
+        )
+
     quiz_input = RunnableLambda(
         lambda data: {
             "topic": data["topic"],
@@ -26,13 +42,16 @@ def get_parallel_chain() -> Runnable:
     )
 
     return RunnableParallel(
-        explanation=explanation_input | get_explanation_chain(),
+        explanation=explanation_input | explanation_chain,
         quiz=quiz_input | get_quiz_chain(),
     )
 
 
 def generate_learning_material(
-    topic: str, learning_level: str, question_count: int = 6
+    topic: str,
+    learning_level: str,
+    question_count: int = 6,
+    memory_context: str = "",
 ) -> dict[str, TopicExplanation | Quiz]:
     """Generate an explanation and quiz concurrently."""
 
@@ -56,14 +75,15 @@ def generate_learning_material(
     )
 
     try:
-        result = get_parallel_chain().invoke(
-            {
-                "topic": topic,
-                "learning_level": learning_level,
-                "question_count": question_count,
-                "distribution": distribution,
-            }
-        )
+        inputs = {
+            "topic": topic,
+            "learning_level": learning_level,
+            "question_count": question_count,
+            "distribution": distribution,
+        }
+        if memory_context:
+            inputs["memory_context"] = memory_context
+        result = get_parallel_chain(memory_context).invoke(inputs)
     except Exception as error:
         raise RuntimeError(f"Could not generate learning material: {error}") from error
 

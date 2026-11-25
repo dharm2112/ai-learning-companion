@@ -76,6 +76,36 @@ def test_parallel_chain_returns_both_outputs_and_passes_inputs() -> None:
     assert quiz_inputs[0]["distribution"] == "3 MCQ, 2 True/False, 1 Short Answer"
 
 
+def test_memory_context_uses_contextual_explanation_chain() -> None:
+    explanation_inputs = []
+    contextual_chain = RunnableLambda(
+        lambda data: explanation_inputs.append(data) or sample_explanation()
+    )
+    quiz_chain = RunnableLambda(lambda data: sample_quiz())
+
+    with patch(
+        "chains.parallel_chain.get_contextual_explanation_chain"
+    ) as get_contextual:
+        with patch("chains.parallel_chain.get_quiz_chain") as get_quiz:
+            get_contextual.return_value = contextual_chain
+            get_quiz.return_value = quiz_chain
+            result = generate_learning_material(
+                "Runnables",
+                "Intermediate",
+                6,
+                "Previously studied LCEL.",
+            )
+
+    assert isinstance(result["explanation"], TopicExplanation)
+    assert explanation_inputs == [
+        {
+            "topic": "Runnables",
+            "learning_level": "Intermediate",
+            "memory_context": "Previously studied LCEL.",
+        }
+    ]
+
+
 def test_invalid_topic_is_rejected() -> None:
     with pytest.raises(ValueError, match="cannot be empty"):
         generate_learning_material(" ", "Beginner")
